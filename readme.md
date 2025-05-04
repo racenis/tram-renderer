@@ -31,3 +31,5 @@ For Fedora based systems try running
 ```
 sudo dnf install mesa-libGL-devel libX11-devel libXcursor-devel libXi-devel libXinerama-devel libXrandr-devel
 ```
+
+![Rendereed teapot](renderer.gif)

@@ -21,6 +21,7 @@
 #include <render/material.h>
 #include <render/api.h>
 #include <render/scene.h>
+#include <render/raytrace/raytrace.h>
 #include <physics/physics.h>
 #include <physics/api.h>
 #include <platform/image.h>
@@ -42,6 +43,7 @@
 #include <extensions/kitchensink/kitchensink.h>
 #include <extensions/kitchensink/entities.h>
 #include <extensions/kitchensink/soundtable.h>
+#include <extensions/kitchensink/imageassembly.h>
 
 using namespace tram;
 using namespace tram::UI;
@@ -60,13 +62,65 @@ struct AnimationRender {
 	float length;
 };
 
-static int current_frame = -1;
+static int current_frame = 0;
 static bool paused = true;
 static bool looping = false;
 static bool previewing = true;
+static bool create_assembly = false;
 
 static AnimationSequence* current_sequence = nullptr;
 static AnimationRender* current_render = nullptr;
+
+
+void UpdateScene() {
+	const float advance = current_render->length / (float)current_render->frames;
+	
+	Core::SetTime((float)current_frame * advance);
+
+	Script::CallFunction(current_sequence->update, {});
+}
+
+void SaveFrame() {
+	char* buffer = (char*)malloc(UI::GetScreenWidth() * UI::GetScreenHeight() * 3);
+
+	std::string file_name = "frame";
+	file_name += std::to_string(current_frame + 1);
+	file_name += ".png";
+	
+	std::cout << "saved out: " << file_name << std::endl;
+	
+	Render::API::GetScreen(buffer, UI::GetScreenWidth(), UI::GetScreenHeight());
+	Platform::SaveImageToDisk(file_name.c_str(), UI::GetScreenWidth(), UI::GetScreenHeight(), buffer);
+	
+	if (create_assembly) {
+		Kitchensink::ImageAssembly::Add(Render::API::GetAssemblyLayers());
+	}
+	
+	free(buffer);
+}
+
+void TryLooping() {
+	if (current_frame >= current_render->frames) {
+		previewing = true;
+		
+		if (looping) {
+			current_frame = 0;
+		} else {
+			current_frame--;
+		}
+	}
+	
+	if (current_frame < 0) {
+		previewing = true;
+		
+		if (looping) {
+			current_frame = current_render->frames - 1;
+		} else {
+			current_frame++;
+		}
+	}
+	
+}
 
 void main_loop();
 
@@ -115,7 +169,7 @@ int main(int argc, const char** argv) {
 			delete current_sequence;
 		}
 		
-		current_frame = -1;
+		current_frame = 0;
 		paused = true;
 		
 		current_sequence = new AnimationSequence {
@@ -160,6 +214,10 @@ int main(int argc, const char** argv) {
 		previewing = false;
 		paused = false;
 		
+		if (Render::API::GetContext() == Render::API::CONTEXT_SOFTWARE) {
+			Render::API::SetInteractiveMode(false);
+		}
+		
 		return true;
 	});
 	
@@ -196,6 +254,21 @@ int main(int argc, const char** argv) {
 		return current_render ? current_render->frames : 0;
 	});
 	
+	Script::SetFunction("SetUseAssembly", {TYPE_BOOL}, [](valuearray_t params) -> value_t {
+		create_assembly = params[0];
+		Render::API::SetUseAssembly(create_assembly);
+		return true;
+	});
+	
+	Script::SetFunction("SetMaterialAssemblyIndex", {TYPE_NAME, TYPE_INT32}, [](valuearray_t params) -> value_t {
+		auto material = Material::Find(params[0]);
+		if (material->GetStatus() != Resource::LOADED) {
+			material->Load();
+		}
+		Render::API::SetMaterialAssemblyIndex(material->GetMaterial(), params[1]);
+		return true;
+	});
+	
 	Script::LoadScript("init");
 	
 	#ifdef __EMSCRIPTEN__
@@ -218,28 +291,41 @@ void main_loop() {
 	UI::Update();
 	Physics::Update();	
 
-	bool save_frame = false;
-
-	if (current_frame >= 0 && current_render && current_sequence) {
-		float advance = current_render->length / (float)current_render->frames;
+	// TODO: check if this logic works with opengl renderer (probably doesn't)
+	
+	// check if raytrace renderer is finished with current frame
+	if (!previewing && Render::API::IsFinishedRendering()) {
+		SaveFrame();
 		
-		Core::SetTime((float)current_frame * advance);
+		// advance to next frame
+		current_frame++;
 		
-		Script::CallFunction(current_sequence->update, {});
+		TryLooping();
+		UpdateScene();
 		
-		if (!paused && ++current_frame > current_render->frames) {
-			previewing = true;
-			
-			if (looping) {
-				current_frame = 0;
-			} else {
-				current_frame--;
+		// render wireframe
+		Render::API::SetInteractiveMode(true);
+		Render::Render();
+		
+		// start rendering the next frame
+		if (!previewing) {
+			Render::API::SetInteractiveMode(false);
+		} else {
+			if (create_assembly) {
+				Kitchensink::ImageAssembly::Save("assembly.image");
+				Kitchensink::ImageAssembly::Reset();
 			}
 		}
-		
-		if (!previewing) save_frame = true;
 	}
 	
+	if (previewing) {
+		if (!paused) {
+			current_frame++;
+		}
+		
+		TryLooping();
+		UpdateScene();
+	}
 	
 	GUI::Begin();
 	Ext::Menu::Update();
@@ -264,26 +350,11 @@ void main_loop() {
 	Ext::Camera::Update();
 	
 	Render::Render();
-	if (!previewing) {
+	if (!previewing && Render::API::GetContext() != Render::API::CONTEXT_SOFTWARE) {
 		UI::EndFrame();
 		Render::Render();
 	}
 	UI::EndFrame();
-	
-	if (save_frame) {
-		char* buffer = (char*)malloc(UI::GetScreenWidth() * UI::GetScreenHeight() * 3);
-		
-		static int f = 0;
-		
-		std::string file_name = "frame";
-		file_name += std::to_string(current_frame); //+ "_n_" + std::to_string(f++);
-		file_name += ".png";
-		
-        Render::API::GetScreen(buffer, UI::GetScreenWidth(), UI::GetScreenHeight());
-        Platform::SaveImageToDisk(file_name.c_str(), UI::GetScreenWidth(), UI::GetScreenHeight(), buffer);
-		
-		free(buffer);
-	}
 	
 	Stats::Collate();
 }
